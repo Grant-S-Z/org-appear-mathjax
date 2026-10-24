@@ -22,8 +22,10 @@ MathJax worker for rendering. It does not require a TeX installation.
 - Org 9.6 or newer
 - [mathjax.el](https://github.com/astoff/mathjax.el) 0.1 or newer
 - Node.js available on `exec-path`
+- Optional: [posframe](https://github.com/tumashu/posframe) for floating live previews
 
-No LaTeX distribution is needed.
+No LaTeX distribution is needed. The optional `posframe` dependency is only
+loaded when the floating editing style is used.
 
 ## Installation
 
@@ -70,14 +72,57 @@ For Xenops-style vertically centered images, use:
 Adjust `org-appear-mathjax-scale` to suit your font and display. Values below
 `1.0` make previews smaller; values above `1.0` make them larger.
 
+### Typora-style source and live preview
+
+Set `org-appear-mathjax-edit-preview` to `t` to keep a live preview visible
+while editing standalone display math:
+
+```elisp
+(setq org-appear-mathjax-edit-preview t
+      org-appear-mathjax-edit-preview-style 'posframe
+      org-appear-mathjax-delay 0.2)
+```
+
+With the `posframe` style, source text is left untouched. A non-focus-stealing
+floating preview appears to the right of the formula, or below it when the
+right side lacks space. Install the optional `posframe` package to use this
+style on a graphic display.
+
+The original `panel` style instead shows source above a framed preview in the
+buffer:
+
+```elisp
+(setq org-appear-mathjax-edit-preview-style 'panel)
+```
+
+Both styles update after the idle delay and disappear when point leaves the
+formula. Inline math remains source-only while being edited.
+
+### Simple siunitx quantities
+
+Set `org-appear-mathjax-siunitx-compat` to `t` to render simple
+`\qty{NUMBER}{UNIT}` expressions without defining a MathJax macro. Plain
+numbers and scientific notation such as `5.67e-8` and `e3` are supported:
+
+```elisp
+(setq org-appear-mathjax-siunitx-compat t)
+```
+
+For example, `\qty{5.67e-8}{W\cdot m^{-2}}` is rendered as
+`5.67\times10^{-8}\,\mathrm{W\cdot m^{-2}}`. This is deliberately not a complete
+implementation of `siunitx`; options, `\SI`, `\num`, and other commands are not
+handled.
+
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `org-appear-mathjax-scale` | `1.0` | Preview scale relative to the source font's x-height |
 | `org-appear-mathjax-inline-ascent` | `baseline` | Inline vertical alignment: `baseline` or `center` |
 | `org-appear-mathjax-center-display` | `t` | Center display formulas in reading mode |
-| `org-appear-mathjax-edit-preview` | `nil` | Show a framed live preview while editing display math |
+| `org-appear-mathjax-edit-preview` | `nil` | Show a live preview while editing display math |
+| `org-appear-mathjax-edit-preview-style` | `panel` | Editing layout: `panel` or floating `posframe` |
 | `org-appear-mathjax-delay` | `0.2` | Idle delay in seconds before reconciling edits |
 | `org-appear-mathjax-macros` | `""` | TeX macro definitions prepended to every formula |
+| `org-appear-mathjax-siunitx-compat` | `nil` | Expand simple `\qty` numbers and units before rendering |
 | `org-appear-mathjax-cache-directory` | platform cache directory | Location of cached SVG geometry |
 | `org-appear-mathjax-timeout` | `30` | Worker response timeout in seconds |
 

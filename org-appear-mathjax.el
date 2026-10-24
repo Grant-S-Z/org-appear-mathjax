@@ -29,11 +29,15 @@
 (require 'seq)
 (require 'image)
 (require 'button)
-(require 'hl-line)
 (require 'org)
 (require 'org-element)
 
 (declare-function mathjax-available-p "mathjax")
+(declare-function posframe-show "posframe")
+(declare-function posframe-hide "posframe")
+(declare-function posframe-poshandler-point-top-left-corner "posframe")
+(declare-function posframe-poshandler-point-bottom-left-corner "posframe")
+(declare-function posframe-hidehandler-when-buffer-switch "posframe")
 
 (defgroup org-appear-mathjax nil
   "Org MathJax previews that reveal source at point."
@@ -41,6 +45,7 @@
   :prefix "org-appear-mathjax-")
 
 (defvar org-appear-mathjax-mode)
+(defvar org-appear-mathjax--objects)
 
 (defun org-appear-mathjax--set-option (option value)
   "Set OPTION to VALUE and refresh buffers using its default."
@@ -49,15 +54,29 @@
     (with-current-buffer buffer
       (when (and (bound-and-true-p org-appear-mathjax-mode)
                  (not (local-variable-p option)))
-        (if (eq option 'org-appear-mathjax-macros)
+        (when (eq option 'org-appear-mathjax-edit-preview-style)
+          (mapc #'org-appear-mathjax--clear-panel org-appear-mathjax--objects))
+        (if (memq option '(org-appear-mathjax-macros
+                           org-appear-mathjax-siunitx-compat))
             (org-appear-mathjax-refresh)
           (org-appear-mathjax--redisplay))))))
 
 (defcustom org-appear-mathjax-edit-preview nil
-  "Show source above a framed preview while editing display math.
-Nil shows plain source without a frame, and renders when point leaves or
-source reveal stops.  Inline math always uses plain-source editing."
+  "Show a live preview while editing display math.
+Nil renders when point leaves the formula.  Inline math always uses
+plain-source editing.  See `org-appear-mathjax-edit-preview-style'."
   :type 'boolean :safe #'booleanp :group 'org-appear-mathjax
+  :initialize #'custom-initialize-default :set #'org-appear-mathjax--set-option)
+
+(defcustom org-appear-mathjax-edit-preview-style 'panel
+  "Presentation used for live previews while editing display math.
+`panel' shows source above a framed preview in the buffer.
+`posframe' leaves the source untouched and shows a floating preview beside
+it, falling back below the formula when there is insufficient room.
+The latter requires the optional posframe package and a graphic display."
+  :type '(choice (const :tag "In-buffer panel" panel)
+                 (const :tag "Floating posframe" posframe))
+  :group 'org-appear-mathjax
   :initialize #'custom-initialize-default :set #'org-appear-mathjax--set-option)
 
 (defcustom org-appear-mathjax-delay 0.2
@@ -67,6 +86,13 @@ source reveal stops.  Inline math always uses plain-source editing."
 (defcustom org-appear-mathjax-macros ""
   "MathJax macro definitions prepended independently to every formula."
   :type 'string :group 'org-appear-mathjax
+  :initialize #'custom-initialize-default :set #'org-appear-mathjax--set-option)
+
+(defcustom org-appear-mathjax-siunitx-compat nil
+  "Whether to expand simple \\qty{NUMBER}{UNIT} expressions before rendering.
+Plain numbers and scientific notation such as 5.67e-8 and e3 are supported.
+This is not a complete implementation of the LaTeX siunitx package."
+  :type 'boolean :safe #'booleanp :group 'org-appear-mathjax
   :initialize #'custom-initialize-default :set #'org-appear-mathjax--set-option)
 
 (defcustom org-appear-mathjax-scale 1.0
@@ -99,8 +125,8 @@ source reveal stops.  Inline math always uses plain-source editing."
   :type 'number :group 'org-appear-mathjax)
 
 (defface org-appear-mathjax-source
-  '((t :inherit hl-line :extend t))
-  "Background of source in a live editing preview."
+  '((t :inherit default :extend t))
+  "Background of source in a live editing preview, independent of `hl-line'."
   :group 'org-appear-mathjax)
 
 (defface org-appear-mathjax-preview
@@ -242,6 +268,61 @@ MathJax.startup.promise.then(() => {
             :width width :ex (/ height height-ex)
             :ascent (if display -1 (max 0 (min 100 (round (* 100 (+ 1 (/ (or align 0) height-ex)))))))))))
 
+;;; Lightweight siunitx compatibility
+
+(defun org-appear-mathjax--escaped-p (position)
+  "Return non-nil when POSITION follows an odd run of backslashes."
+  (save-excursion
+    (goto-char position)
+    (while (eq (char-before) ?\\) (backward-char))
+    (cl-oddp (- position (point)))))
+
+(defun org-appear-mathjax--braced-argument ()
+  "Read a braced argument after its opening brace at point.
+Return its contents and leave point after the closing brace, or return nil."
+  (let ((beg (point)) (depth 1))
+    (while (and (> depth 0) (not (eobp)))
+      (let ((position (point)) (character (char-after)))
+        (unless (org-appear-mathjax--escaped-p position)
+          (cond ((eq character ?{) (setq depth (1+ depth)))
+                ((eq character ?}) (setq depth (1- depth)))))
+        (forward-char)))
+    (when (= depth 0)
+      (buffer-substring-no-properties beg (1- (point))))))
+
+(defun org-appear-mathjax--expand-number (number)
+  "Return TeX for NUMBER, expanding common siunitx scientific notation."
+  (if (string-match
+       "\\`\\([+-]?\\(?:[0-9]+\\(?:\\.[0-9]*\\)?\\|\\.[0-9]+\\)\\)?[eE]\\([+-]?[0-9]+\\)\\'"
+       number)
+      (let ((mantissa (match-string 1 number))
+            (exponent (match-string 2 number)))
+        (concat (if (or (null mantissa) (string-empty-p mantissa))
+                    "10"
+                  (concat mantissa "\\times10"))
+                "^{" exponent "}"))
+    number))
+
+(defun org-appear-mathjax--expand-siunitx (body)
+  "Expand simple \\qty{NUMBER}{UNIT} expressions in BODY."
+  (with-temp-buffer
+    (insert body)
+    (goto-char (point-min))
+    (while (re-search-forward "\\\\qty{" nil t)
+      (let ((start (match-beginning 0)))
+        (unless (org-appear-mathjax--escaped-p start)
+          (let ((number (org-appear-mathjax--braced-argument)) unit)
+            (when number
+              (skip-chars-forward " \t\n")
+              (when (eq (char-after) ?{)
+                (forward-char)
+                (setq unit (org-appear-mathjax--braced-argument))))
+            (when (and number unit)
+              (delete-region start (point))
+              (insert (org-appear-mathjax--expand-number number)
+                      "\\,\\mathrm{" unit "}"))))))
+    (buffer-substring-no-properties (point-min) (point-max))))
+
 (defun org-appear-mathjax--key (body display)
   "Return the content key for BODY, DISPLAY and this buffer's macros."
   (secure-hash 'sha1 (format "standalone-v1\0%s\0%S\0%s"
@@ -262,7 +343,10 @@ MathJax.startup.promise.then(() => {
   "Return cached BODY in DISPLAY style, or nil and call CALLBACK when ready.
 Results are plists containing SVG geometry or an :error string.  Identical
 pending requests share a compile.  Setup failures are not cached."
-  (let* ((key (org-appear-mathjax--key body display))
+  (let* ((body (if org-appear-mathjax-siunitx-compat
+                   (org-appear-mathjax--expand-siunitx body)
+                 body))
+         (key (org-appear-mathjax--key body display))
          (entry (org-appear-mathjax--entry key)))
     (if entry entry
       (let ((waiting (gethash key org-appear-mathjax--pending)))
@@ -438,6 +522,12 @@ Org's parser rejects delimiter-like text in source, example and comment blocks."
     (with-help-window "*MathJax error*"
       (princ error) (princ "\n\n") (princ (overlay-get ov 'org-appear-mathjax--source)))))
 
+(defun org-appear-mathjax--show-edit-preview (ov)
+  "Show OV's live preview using the configured editing style."
+  (if (eq org-appear-mathjax-edit-preview-style 'posframe)
+      (org-appear-mathjax--show-posframe ov)
+    (org-appear-mathjax--show-panel ov)))
+
 (defun org-appear-mathjax--sync (ov)
   "Synchronize OV's source/image presentation without compiling."
   (when (overlay-buffer ov)
@@ -458,7 +548,7 @@ Org's parser rejects delimiter-like text in source, example and comment blocks."
                (not (eq (overlay-get ov 'org-appear-mathjax--kind) 'inline))
                (save-excursion (goto-char (overlay-start ov)) (skip-chars-backward " \t")
                                (and (bolp) (progn (goto-char (overlay-end ov)) (skip-chars-forward " \t") (eolp)))))
-          (org-appear-mathjax--show-panel ov)
+          (org-appear-mathjax--show-edit-preview ov)
         (org-appear-mathjax--clear-panel ov))
       (when (and display (not (eq display old)))
         (run-hook-with-args 'org-appear-mathjax-preview-functions ov display)))))
@@ -652,10 +742,95 @@ With prefix RECOMPILE, invalidate this buffer's cached formulas first."
   (with-current-buffer (window-buffer window)
     (when org-appear-mathjax-mode (org-appear-mathjax--redisplay))))
 
+;;; Optional floating live preview
+
+(defun org-appear-mathjax--posframe-available-p ()
+  "Return non-nil when floating previews can use this display."
+  (and (display-graphic-p) (require 'posframe nil t)))
+
+(defun org-appear-mathjax--posframe-buffer-name ()
+  "Return the floating preview buffer name for the current source buffer."
+  (format " *org-appear-mathjax-preview:%s*" (buffer-name)))
+
+(defun org-appear-mathjax--hide-posframe (ov)
+  "Hide the floating preview owned by OV."
+  (when-let* ((name (overlay-get ov 'org-appear-mathjax--posframe-buffer)))
+    (when (fboundp 'posframe-hide)
+      (posframe-hide name))
+    (overlay-put ov 'org-appear-mathjax--posframe-buffer nil)))
+
+(defun org-appear-mathjax--posframe-right-x (info)
+  "Return INFO's unclamped right-side x coordinate, or nil if unavailable."
+  (let* ((window (plist-get info :parent-window))
+         (position (plist-get info :position))
+         (position-info (and (integer-or-marker-p position)
+                             (posn-at-point position window))))
+    (when position-info
+      (+ (car (window-inside-pixel-edges window))
+         (- (or (car (posn-x-y position-info)) 0)
+            (or (car (posn-object-x-y position-info)) 0))
+         (or (plist-get info :x-pixel-offset) 0)))))
+
+(defun org-appear-mathjax--poshandler (info)
+  "Place INFO's posframe right of its formula, or below when space is tight."
+  (let ((x (org-appear-mathjax--posframe-right-x info))
+        (window (plist-get info :parent-window)))
+    (if (and x (<= (+ x (or (plist-get info :posframe-width) 0))
+                   (nth 2 (window-inside-pixel-edges window))))
+        (cons x (cdr (org-appear-mathjax--posframe-point-top-left info)))
+      (org-appear-mathjax--posframe-point-bottom-left info))))
+
+(defun org-appear-mathjax--posframe-point-top-left (info)
+  "Return the built-in top-left position for INFO."
+  (posframe-poshandler-point-top-left-corner info))
+
+(defun org-appear-mathjax--posframe-point-bottom-left (info)
+  "Return the built-in bottom-left position for INFO."
+  (posframe-poshandler-point-bottom-left-corner info))
+
+(defun org-appear-mathjax--show-posframe (ov)
+  "Show OV's live preview without changing its source presentation."
+  (if (not (org-appear-mathjax--posframe-available-p))
+      (org-appear-mathjax--hide-posframe ov)
+    (let* ((name (org-appear-mathjax--posframe-buffer-name))
+           (image (overlay-get ov 'org-appear-mathjax--image))
+           (error (and (not (overlay-get ov 'org-appear-mathjax--modified))
+                       (plist-get (overlay-get ov 'org-appear-mathjax--entry) :error)))
+           (content
+            (cond
+             (image (let ((padded (copy-sequence image)))
+                      (setf (image-property padded :margin) '(8 . 8))
+                      (propertize " " 'display padded)))
+             (error (propertize
+                     (concat "MathJax: "
+                             (truncate-string-to-width
+                              (replace-regexp-in-string "[\n\r\t]+" " " error)
+                              60 nil nil "…"))
+                     'face 'error))
+             (t (propertize "Rendering…" 'face 'shadow))))
+           (box (face-attribute 'org-appear-mathjax-preview :box nil t))
+           (border (or (and (listp box) (plist-get box :color))
+                       (and (stringp box) box)
+                       (face-foreground 'shadow nil t))))
+      (overlay-put ov 'org-appear-mathjax--posframe-buffer name)
+      (posframe-show name
+                     :string content
+                     :position (overlay-end ov)
+                     :poshandler #'org-appear-mathjax--poshandler
+                     :x-pixel-offset 12
+                     :border-width 1
+                     :border-color border
+                     :background-color (face-attribute 'default :background nil t)
+                     :foreground-color (face-attribute 'default :foreground nil t)
+                     :accept-focus nil
+                     :lines-truncate t
+                     :hidehandler #'posframe-hidehandler-when-buffer-switch))))
+
 ;;; Optional source/preview frame
 
 (defun org-appear-mathjax--clear-panel (ov)
-  "Remove the frame owned by OV."
+  "Remove any in-buffer or floating preview owned by OV."
+  (org-appear-mathjax--hide-posframe ov)
   (when (overlay-get ov 'org-appear-mathjax--rows)
     (mapc #'delete-overlay (overlay-get ov 'org-appear-mathjax--rows))
     (dolist (property '(org-appear-mathjax--rows org-appear-mathjax--last-row
@@ -706,6 +881,7 @@ With prefix RECOMPILE, invalidate this buffer's cached formulas first."
 
 (defun org-appear-mathjax--show-panel (ov)
   "Update OV's frame only when its image or status changes."
+  (org-appear-mathjax--hide-posframe ov)
   (org-appear-mathjax--source-rows ov)
   (let* ((image (overlay-get ov 'org-appear-mathjax--image))
          (error (and (not (overlay-get ov 'org-appear-mathjax--modified))
@@ -713,7 +889,9 @@ With prefix RECOMPILE, invalidate this buffer's cached formulas first."
          (status (cond (image 'image) (error 'error) (t 'pending))))
     (unless (and (eq image (overlay-get ov 'org-appear-mathjax--shown-image))
                  (eq status (overlay-get ov 'org-appear-mathjax--status)))
-      (let* ((content
+      (let* ((row (overlay-get ov 'org-appear-mathjax--last-row))
+             (tail (overlay-get row 'org-appear-mathjax--tail))
+             (content
               (cond
                (image (let ((padded (copy-sequence image)))
                         (setf (image-property padded :margin) '(0 . 8))
@@ -729,13 +907,14 @@ With prefix RECOMPILE, invalidate this buffer's cached formulas first."
                                                                                (org-appear-mathjax-show-error))))))
                                      'face 'link)))
                (t (propertize "Waiting for a renderable formula…" 'face 'shadow))))
-             (line (concat " " content (propertize " " 'display '(space :align-to (- right 1))) " ")))
+             (line (concat content tail)))
         (add-face-text-property 0 (length line) 'org-appear-mathjax-preview t line)
         (overlay-put ov 'org-appear-mathjax--preview-body
                      (propertize
                       (concat (propertize "\n" 'face '(:inherit default :box nil :extend t)) line
                               (and (= (save-excursion (goto-char (overlay-end ov)) (line-end-position)) (point-max)) "\n"))
-                      'line-prefix "" 'wrap-prefix ""
+                      'line-prefix (overlay-get row 'line-prefix)
+                      'wrap-prefix (overlay-get row 'wrap-prefix)
                       'help-echo (lambda (_window _object _position)
                                    (or error (and image (overlay-get ov 'org-appear-mathjax--modified)
                                                   "Previous preview; waiting for the edited formula"))))))
